@@ -1,9 +1,10 @@
 /*
  * ================================================================
  *  RiegoAuto — Sistema automático de riego con ESP32
- *  Controla una bomba de agua (relé) y un servo para el movimiento
+ *  Controla una bomba de agua (relé) y un servomotor para el movimiento
  *  según la humedad del suelo leída por un sensor analógico.
- *  El umbral de humedad se puede ajustar desde el monitor serie.
+ *  El umbral de humedad se puede ajustar desde el monitor serie con la 
+ *  comunicación UART
  * ================================================================
  */
 
