@@ -8,340 +8,486 @@
  * ================================================================
  */
 
-// ── Librerías estándar de C ──────────────────────────────────────
-#include <stdio.h>          // printf, fgets, snprintf
-#include <string.h>         // strcspn, strlen
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 
-// ── Librerías de FreeRTOS (sistema operativo en tiempo real) ─────
-#include "freertos/FreeRTOS.h"  // núcleo de FreeRTOS
-#include "freertos/task.h"      // xTaskCreate, vTaskDelay
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-// ── Librerías de drivers del ESP32 ──────────────────────────────
-#include "driver/gpio.h"            // control de pines digitales (relé)
-#include "driver/ledc.h"            // PWM por hardware (servo)
-#include "driver/adc.h"             // ADC legacy (requerido por compatibilidad)
-#include "esp_adc/adc_oneshot.h"    // ADC moderno oneshot (lectura del sensor)
-#include "driver/i2c.h"             // comunicación I2C (pantalla LCD)
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "driver/adc.h"
+#include "esp_adc/adc_oneshot.h"
+#include "driver/i2c.h"
 
 // ================================================================
 //  CONFIGURACIÓN — ADC / Sensor de humedad del suelo
 // ================================================================
-#define HUM_ADC_CHANNEL ADC_CHANNEL_6   // Canal ADC6 = GPIO34 del ESP32
-#define ADC_UNIT        ADC_UNIT_1      // Unidad ADC1 (GPIOs 32-39)
-#define ADC_SECO        1178            // Valor ADC cuando el sensor está en aire (0% humedad)
-#define ADC_MOJADO      617             // Valor ADC cuando el sensor está en agua (100% humedad)
+#define HUM_ADC_CHANNEL ADC_CHANNEL_6
+#define ADC_UNIT        ADC_UNIT_1
+#define ADC_SECO        1178
+#define ADC_MOJADO      617
 
 // ================================================================
-//  CONFIGURACIÓN — Servo motor (válvula de agua)
-//  Controlado por señal PWM de 50Hz usando el periférico LEDC
+//  CONFIGURACIÓN — Servo motor
 // ================================================================
-#define SERVO_GPIO       GPIO_NUM_22        // Pin de señal del servo
-#define SERVO_MODE       LEDC_LOW_SPEED_MODE // Modo de velocidad del PWM
-#define SERVO_TIMER      LEDC_TIMER_0       // Timer 0 del LEDC
-#define SERVO_CHANNEL    LEDC_CHANNEL_0     // Canal 0 del LEDC
-#define SERVO_RESOLUTION LEDC_TIMER_16_BIT  // Resolución de 16 bits (0-65535)
-#define SERVO_FREQ_HZ    50                 // Frecuencia PWM: 50Hz (estándar servo)
-#define SERVO_MIN_US     500                // Pulso mínimo: 500µs = 0 grados
-#define SERVO_MAX_US     2500               // Pulso máximo: 2500µs = 180 grados
-#define SERVO_PERIOD_US  20000              // Período total: 20000µs = 50Hz
+#define SERVO_GPIO       GPIO_NUM_22
+#define SERVO_MODE       LEDC_LOW_SPEED_MODE
+#define SERVO_TIMER      LEDC_TIMER_0
+#define SERVO_CHANNEL    LEDC_CHANNEL_0
+#define SERVO_RESOLUTION LEDC_TIMER_16_BIT
+#define SERVO_FREQ_HZ    50
+#define SERVO_MIN_US     500
+#define SERVO_MAX_US     2500
+#define SERVO_PERIOD_US  20000
+
+// Velocidad del barrido del servo
+#define SERVO_STEP_US    10
+#define LOOP_DELAY_MS    30
 
 // ================================================================
-//  CONFIGURACIÓN — Relé (bomba de agua)
-//  Relé activo en alto: ON=1 enciende la bomba, OFF=0 la apaga
+//  CONFIGURACIÓN — Relé
 // ================================================================
-#define RELE_GPIO  GPIO_NUM_23  // Pin de control del relé
-#define RELE_ON    1            // Nivel alto = relé activado = bomba encendida
-#define RELE_OFF   0            // Nivel bajo = relé desactivado = bomba apagada
+#define RELE_GPIO  GPIO_NUM_23
+#define RELE_ON    1
+#define RELE_OFF   0
 
 // ================================================================
 //  CONFIGURACIÓN — I2C y pantalla LCD 16x2 con módulo PCF8574
-//  El PCF8574 es un expansor de puertos I2C que controla el LCD
 // ================================================================
-#define I2C_MASTER_SCL_IO   18          // Pin del reloj I2C (SCL)
-#define I2C_MASTER_SDA_IO   19          // Pin de datos I2C (SDA)
-#define I2C_MASTER_NUM      I2C_NUM_0   // Puerto I2C número 0
-#define I2C_MASTER_FREQ_HZ  100000      // Velocidad I2C: 100kHz (modo estándar)
-#define PCF8574_ADDR        0x27        // Dirección I2C del módulo PCF8574
-#define LCD_BACKLIGHT       0x08        // Bit 3 del PCF8574 = luz de fondo del LCD
-#define LCD_EN              0x04        // Bit 2 del PCF8574 = pin Enable del LCD
-#define LCD_RS              0x01        // Bit 0 del PCF8574 = pin RS del LCD (0=cmd, 1=dato)
+#define I2C_MASTER_SCL_IO   18
+#define I2C_MASTER_SDA_IO   19
+#define I2C_MASTER_NUM      I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ  100000
+#define PCF8574_ADDR        0x27
+#define LCD_BACKLIGHT       0x08
+#define LCD_EN              0x04
+#define LCD_RS              0x01
 
 // ================================================================
 //  VARIABLES GLOBALES
 // ================================================================
-static float hum_control = 30.0f;      // Umbral de humedad (%). Si humedad < este valor → riega
-static char  uart_input[32] = "30";    // Guarda el último valor recibido por monitor serie (para mostrar en LCD)
+static float hum_control = 30.0f;
+static char  uart_input[32] = "30";
 
 // ================================================================
-//  FUNCIONES LCD — Comunicación con pantalla vía I2C + PCF8574
+//  SISTEMA DE LOGGING
 // ================================================================
+#define LOG_INFO(code, msg)  printf("[INFO ][%lu ms][%s] %s\n",  (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS), code, msg)
+#define LOG_WARN(code, msg)  printf("[WARN ][%lu ms][%s] %s\n",  (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS), code, msg)
+#define LOG_ERROR(code, msg) printf("[ERROR][%lu ms][%s] %s\n",  (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS), code, msg)
 
-/*
- * pcf8574_write — Envía un byte al expansor PCF8574 por I2C.
- * El PCF8574 convierte ese byte en 8 señales digitales que
- * controlan los pines del LCD (RS, EN, backlight y datos D4-D7).
- */
+static int last_riego_activo = -1;
+static int last_sensor_status_logged = -1;
+// ================================================================
+//  ESTADOS Y ERRORES DEL SENSOR
+// ================================================================
+typedef enum {
+    SENSOR_OK = 0,
+    SENSOR_WARN_FUERA_CALIBRACION,
+    SENSOR_ERR_ADC_BAJO,
+    SENSOR_ERR_ADC_ALTO
+} sensor_status_t;
+
+#define ADC_ERROR_LOW      500
+#define ADC_ERROR_HIGH     1300
+#define ADC_CAL_MARGIN     100
+
+// ================================================================
+//  FUNCIONES LCD
+// ================================================================
 esp_err_t pcf8574_write(uint8_t data)
 {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();   // Crea una transacción I2C
-    i2c_master_start(cmd);                           // Condición de inicio I2C
-    i2c_master_write_byte(cmd,                       // Envía dirección del PCF8574
-                          (PCF8574_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, data, true);          // Envía el byte de datos
-    i2c_master_stop(cmd);                            // Condición de parada I2C
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd,
-                                          pdMS_TO_TICKS(1000)); // Ejecuta la transacción
-    i2c_cmd_link_delete(cmd);                        // Libera la memoria
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (PCF8574_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, data, true);
+    i2c_master_stop(cmd);
+
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+
+    i2c_cmd_link_delete(cmd);
+
     return ret;
 }
 
-/*
- * lcd_pulse — Genera un pulso en el pin Enable (EN) del LCD.
- * El LCD HD44780 necesita un pulso EN para leer cada nibble de datos.
- * Secuencia: EN=1 → espera → EN=0
- */
 void lcd_pulse(uint8_t data)
 {
-    pcf8574_write(data | LCD_EN | LCD_BACKLIGHT);           // EN=1, backlight=1
-    vTaskDelay(pdMS_TO_TICKS(1));                           // Espera 1ms
-    pcf8574_write((data & ~LCD_EN) | LCD_BACKLIGHT);        // EN=0, backlight=1
-    vTaskDelay(pdMS_TO_TICKS(1));                           // Espera 1ms
+    pcf8574_write(data | LCD_EN | LCD_BACKLIGHT);
+    vTaskDelay(pdMS_TO_TICKS(1));
+
+    pcf8574_write((data & ~LCD_EN) | LCD_BACKLIGHT);
+    vTaskDelay(pdMS_TO_TICKS(1));
 }
 
-/*
- * lcd_write_nibble — Envía 4 bits (nibble) al LCD.
- * El LCD está en modo 4 bits, así que cada byte se envía en dos partes.
- * rs=0 → comando, rs=1 → dato/carácter
- */
 void lcd_write_nibble(uint8_t nibble, uint8_t rs)
 {
-    uint8_t data = (nibble << 4) & 0xF0;    // Coloca los 4 bits en la parte alta del byte
-    if (rs) data |= LCD_RS;                 // Si es dato, activa el pin RS
-    lcd_pulse(data);                        // Envía con pulso EN
+    uint8_t data = (nibble << 4) & 0xF0;
+
+    if (rs) {
+        data |= LCD_RS;
+    }
+
+    lcd_pulse(data);
 }
 
-/*
- * lcd_write_byte — Envía un byte completo al LCD en dos nibbles.
- * Primero envía los 4 bits más significativos, luego los 4 menos significativos.
- * rs=0 → es un comando (ej: limpiar pantalla), rs=1 → es un carácter ASCII
- */
 void lcd_write_byte(uint8_t byte, uint8_t rs)
 {
-    lcd_write_nibble(byte >> 4, rs);        // Envía nibble alto (bits 7-4)
-    lcd_write_nibble(byte & 0x0F, rs);      // Envía nibble bajo (bits 3-0)
+    lcd_write_nibble(byte >> 4, rs);
+    lcd_write_nibble(byte & 0x0F, rs);
 }
 
-/*
- * lcd_init — Inicializa el LCD HD44780 en modo 4 bits.
- * Sigue la secuencia de inicialización del datasheet del HD44780:
- * reset por software → modo 4 bits → configuración de pantalla
- */
 void lcd_init(void)
 {
-    vTaskDelay(pdMS_TO_TICKS(50));          // Espera 50ms al encender (estabilización)
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Reset por software — secuencia requerida por el datasheet
-    lcd_write_nibble(0x03, 0); vTaskDelay(pdMS_TO_TICKS(5));  // Reset 1
-    lcd_write_nibble(0x03, 0); vTaskDelay(pdMS_TO_TICKS(5));  // Reset 2
-    lcd_write_nibble(0x03, 0); vTaskDelay(pdMS_TO_TICKS(1));  // Reset 3
-    lcd_write_nibble(0x02, 0);                                 // Activa modo 4 bits
+    pcf8574_write(LCD_BACKLIGHT);
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    // Configuración del LCD
-    lcd_write_byte(0x28, 0);    // Function Set: 4 bits, 2 líneas, caracteres 5x8
-    lcd_write_byte(0x0C, 0);    // Display Control: pantalla ON, cursor OFF, parpadeo OFF
-    lcd_write_byte(0x06, 0);    // Entry Mode: cursor avanza a la derecha automáticamente
-    lcd_write_byte(0x01, 0);    // Clear Display: borra toda la pantalla
-    vTaskDelay(pdMS_TO_TICKS(2)); // Espera 2ms (el comando clear tarda más)
+    lcd_write_nibble(0x03, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    lcd_write_nibble(0x03, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    lcd_write_nibble(0x03, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    lcd_write_nibble(0x02, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    lcd_write_byte(0x28, 0);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    lcd_write_byte(0x0C, 0);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    lcd_write_byte(0x06, 0);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    lcd_write_byte(0x01, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
 
-/*
- * lcd_set_cursor — Mueve el cursor a una posición específica del LCD.
- * col: columna (0-15), row: fila (0=primera línea, 1=segunda línea)
- * La segunda línea en el HD44780 empieza en la dirección 0x40
- */
 void lcd_set_cursor(uint8_t col, uint8_t row)
 {
-    uint8_t row_offsets[] = {0x00, 0x40};                       // Offsets de cada fila
-    lcd_write_byte(0x80 | (col + row_offsets[row]), 0);         // Comando set DDRAM address
+    uint8_t row_offsets[] = {0x00, 0x40};
+
+    lcd_write_byte(0x80 | (col + row_offsets[row]), 0);
 }
 
-/*
- * lcd_print — Escribe una cadena de texto en la posición actual del cursor.
- * Envía cada carácter ASCII uno por uno con rs=1 (modo dato)
- */
 void lcd_print(const char *str)
 {
-    while (*str) lcd_write_byte(*str++, 1); // Envía cada carácter hasta el '\0'
+    while (*str) {
+        lcd_write_byte(*str++, 1);
+    }
 }
-
 // ================================================================
-//  FUNCIONES SERVO — Control de ángulo por PWM
+//  FUNCIONES LCD — Mejoras de visualización
 // ================================================================
-
-/*
- * servo_angle_to_duty — Convierte un ángulo (0-180°) en valor de duty cycle.
- * El servo espera pulsos entre 500µs (0°) y 2500µs (180°) cada 20ms.
- * El duty se invierte porque el hardware tiene la lógica al revés.
- */
-uint32_t servo_angle_to_duty(int angle)
+void lcd_print_line(uint8_t row, const char *text)
 {
-    if (angle < 0)   angle = 0;     // Límite inferior
-    if (angle > 180) angle = 180;   // Límite superior
+    char line[17];
 
-    // Calcula el ancho de pulso en microsegundos según el ángulo
-    uint32_t pulse_us = SERVO_MIN_US +
-                        ((SERVO_MAX_US - SERVO_MIN_US) * angle) / 180;
+    snprintf(line, sizeof(line), "%-16s", text);
 
-    uint32_t max_duty    = (1 << 16) - 1;                   // Valor máximo con 16 bits = 65535
-    uint32_t duty_normal = (pulse_us * max_duty) / SERVO_PERIOD_US; // Duty proporcional
-
-    return max_duty - duty_normal;  // Se invierte porque el hardware lo requiere
+    lcd_set_cursor(0, row);
+    lcd_print(line);
 }
 
-/*
- * servo_write_angle — Mueve el servo al ángulo indicado.
- * Calcula el duty cycle y lo aplica al canal LEDC configurado.
- */
-void servo_write_angle(int angle)
+sensor_status_t sensor_check_status(int adc_raw)
 {
-    uint32_t duty = servo_angle_to_duty(angle);
-    ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, duty);     // Establece el nuevo duty
-    ledc_update_duty(SERVO_MODE, SERVO_CHANNEL);        // Aplica el cambio
+    if (adc_raw <= ADC_ERROR_LOW) {
+        return SENSOR_ERR_ADC_BAJO;
+    }
+
+    if (adc_raw >= ADC_ERROR_HIGH) {
+        return SENSOR_ERR_ADC_ALTO;
+    }
+
+    if (adc_raw < (ADC_MOJADO - ADC_CAL_MARGIN) ||
+        adc_raw > (ADC_SECO + ADC_CAL_MARGIN)) {
+        return SENSOR_WARN_FUERA_CALIBRACION;
+    }
+
+    return SENSOR_OK;
+}
+
+void lcd_update_status(float humedad, float hum_control, sensor_status_t sensor_status, int riego_activo)
+{
+    char line[17];
+
+    if (sensor_status == SENSOR_ERR_ADC_BAJO) {
+        lcd_print_line(0, "ERROR SENSOR");
+        lcd_print_line(1, "ADC MUY BAJO");
+        return;
+    }
+
+    if (sensor_status == SENSOR_ERR_ADC_ALTO) {
+        lcd_print_line(0, "ERROR SENSOR");
+        lcd_print_line(1, "ADC MUY ALTO");
+        return;
+    }
+
+    if (sensor_status == SENSOR_WARN_FUERA_CALIBRACION) {
+        snprintf(line, sizeof(line), "Hum:%5.1f%% WARN", humedad);
+        lcd_print_line(0, line);
+
+        snprintf(line, sizeof(line), "Ctl:%5.1f%%", hum_control);
+        lcd_print_line(1, line);
+        return;
+    }
+
+    snprintf(line, sizeof(line), "Hum:%5.1f%% %s", humedad, riego_activo ? "RIE" : "OK ");
+    lcd_print_line(0, line);
+
+    snprintf(line, sizeof(line), "Ctl:%5.1f%%", hum_control);
+    lcd_print_line(1, line);
+}
+
+
+// ================================================================
+//  FUNCIONES SERVO
+// ================================================================
+uint32_t servo_pulse_to_duty(uint32_t pulse_us)
+{
+    uint32_t max_duty = (1 << 16) - 1;
+    uint32_t duty = (pulse_us * max_duty) / SERVO_PERIOD_US;
+
+    return duty;
+}
+
+void servo_write_pulse(uint32_t pulse_us)
+{
+    uint32_t duty = servo_pulse_to_duty(pulse_us);
+
+    ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, duty);
+    ledc_update_duty(SERVO_MODE, SERVO_CHANNEL);
+}
+
+void servo_apagar(void)
+{
+    ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, 0);
+    ledc_update_duty(SERVO_MODE, SERVO_CHANNEL);
 }
 
 // ================================================================
-//  TAREA UART — Recibe el umbral de humedad por monitor serie
+//  TAREA UART
 // ================================================================
-
-/*
- * uart_monitor_task — Tarea FreeRTOS que corre en paralelo al loop principal.
- * Espera que el usuario escriba un número en el monitor serie (0-100)
- * y actualiza el umbral de humedad hum_control en tiempo real.
- */
 void uart_monitor_task(void *arg)
 {
     char line[32];
+
     while (1) {
-        // fgets espera una línea completa del teclado (termina con Enter)
         if (fgets(line, sizeof(line), stdin) != NULL) {
-            line[strcspn(line, "\r\n")] = 0;    // Elimina el salto de línea del final
-            hum_control = atof(line);            // Convierte el texto a número float
-            snprintf(uart_input, sizeof(uart_input), "%.1f", hum_control); // Guarda para el LCD
+            line[strcspn(line, "\r\n")] = 0;
+
+            hum_control = atof(line);
+
+            snprintf(uart_input, sizeof(uart_input), "%.1f", hum_control);
+
+            char log_msg[64];
+            snprintf(log_msg, sizeof(log_msg), "Nuevo umbral de humedad: %.1f%%", hum_control);
+            LOG_INFO("UART_01", log_msg);
         }
-        vTaskDelay(pdMS_TO_TICKS(100));          // Cede el CPU cada 100ms
+
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
-
 // ================================================================
-//  APP_MAIN — Punto de entrada principal del programa
+//  APP_MAIN
 // ================================================================
 void app_main(void)
 {
     // ── Inicialización ADC ───────────────────────────────────────
-    // Configura el GPIO34 para leer voltaje analógico del sensor de humedad
-    adc_oneshot_unit_init_cfg_t init_config = { .unit_id = ADC_UNIT };
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT
+    };
+
     adc_oneshot_unit_handle_t adc_handle;
-    adc_oneshot_new_unit(&init_config, &adc_handle);    // Inicializa la unidad ADC
+
+    adc_oneshot_new_unit(&init_config, &adc_handle);
 
     adc_oneshot_chan_cfg_t adc_config = {
-        .bitwidth = ADC_BITWIDTH_12,    // Resolución 12 bits (valores 0-4095)
-        .atten    = ADC_ATTEN_DB_11,    // Atenuación 11dB → rango 0 a ~3.3V
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten    = ADC_ATTEN_DB_11,
     };
-    adc_oneshot_config_channel(adc_handle, HUM_ADC_CHANNEL, &adc_config);
 
-    // ── Inicialización Servo (LEDC PWM) ──────────────────────────
-    // Configura el timer PWM a 50Hz con resolución de 16 bits
+    adc_oneshot_config_channel(adc_handle, HUM_ADC_CHANNEL, &adc_config);
+    LOG_INFO("ADC_01", "ADC inicializado en GPIO34 / ADC_CHANNEL_6");
+
+    // ── Inicialización Servo ─────────────────────────────────────
     ledc_timer_config_t timer = {
         .speed_mode      = SERVO_MODE,
         .timer_num       = SERVO_TIMER,
         .duty_resolution = SERVO_RESOLUTION,
         .freq_hz         = SERVO_FREQ_HZ,
-        .clk_cfg         = LEDC_AUTO_CLK,   // Selección automática de reloj
+        .clk_cfg         = LEDC_AUTO_CLK,
     };
+
     ledc_timer_config(&timer);
 
-    // Asigna el canal PWM al GPIO del servo
     ledc_channel_config_t channel = {
         .gpio_num   = SERVO_GPIO,
         .speed_mode = SERVO_MODE,
         .channel    = SERVO_CHANNEL,
         .timer_sel  = SERVO_TIMER,
-        .duty       = 0,        // Duty inicial = 0 (servo en reposo)
+        .duty       = 0,
         .hpoint     = 0,
     };
+
     ledc_channel_config(&channel);
 
+   servo_apagar();
+    LOG_INFO("SERVO_01", "Servo inicializado en GPIO22");
+
     // ── Inicialización Relé ──────────────────────────────────────
-    // Configura el GPIO23 como salida digital para controlar el relé
     gpio_config_t io_conf = {
-        .pin_bit_mask  = (1ULL << RELE_GPIO),   // Máscara del pin
-        .mode          = GPIO_MODE_OUTPUT,       // Configurar como salida
+        .pin_bit_mask  = (1ULL << RELE_GPIO),
+        .mode          = GPIO_MODE_OUTPUT,
         .pull_up_en    = GPIO_PULLUP_DISABLE,
         .pull_down_en  = GPIO_PULLDOWN_DISABLE,
-        .intr_type     = GPIO_INTR_DISABLE,      // Sin interrupción
+        .intr_type     = GPIO_INTR_DISABLE,
     };
+
     gpio_config(&io_conf);
-    gpio_set_level(RELE_GPIO, RELE_OFF);         // Inicia con la bomba apagada
+    gpio_set_level(RELE_GPIO, RELE_OFF);
+    LOG_INFO("RELE_01", "Rele inicializado apagado en GPIO23");
 
     // ── Inicialización I2C y LCD ─────────────────────────────────
-    // Configura el bus I2C para comunicarse con el módulo PCF8574 del LCD
     i2c_config_t i2c_conf = {
-        .mode             = I2C_MODE_MASTER,        // ESP32 es el maestro I2C
-        .sda_io_num       = I2C_MASTER_SDA_IO,      // GPIO19 = línea de datos
-        .sda_pullup_en    = GPIO_PULLUP_ENABLE,      // Resistencia pull-up interna en SDA
-        .scl_io_num       = I2C_MASTER_SCL_IO,      // GPIO18 = línea de reloj
-        .scl_pullup_en    = GPIO_PULLUP_ENABLE,      // Resistencia pull-up interna en SCL
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,     // Velocidad: 100kHz
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = I2C_MASTER_SDA_IO,
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_io_num       = I2C_MASTER_SCL_IO,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
+
     i2c_param_config(I2C_MASTER_NUM, &i2c_conf);
     i2c_driver_install(I2C_MASTER_NUM, i2c_conf.mode, 0, 0, 0);
-    lcd_init();     // Inicializa la pantalla LCD
 
+    lcd_init();
+    LOG_INFO("LCD_01", "LCD inicializada por I2C");
     // ── Crear tarea UART ─────────────────────────────────────────
-    // Corre uart_monitor_task en paralelo para escuchar el monitor serie
     xTaskCreate(uart_monitor_task, "uart_monitor", 2048, NULL, 5, NULL);
 
+       // ── Crear tarea UART ─────────────────────────────────────────
+    xTaskCreate(uart_monitor_task, "uart_monitor", 2048, NULL, 5, NULL);
+    LOG_INFO("SYS_01", "Sistema iniciado correctamente");
+
     // ── Variables del loop principal ─────────────────────────────
-    int   adc_raw = 0;      // Valor crudo del ADC (0-4095)
-    float humedad = 0.0f;   // Porcentaje de humedad calculado (0-100%)
-    char  lcd_msg[64];      // Buffer para el mensaje del LCD
+    int   adc_raw = 0;
+    float humedad = 0.0f;
 
-    // ================================================================
-    //  LOOP PRINCIPAL — Se ejecuta indefinidamente cada 500ms
-    // ================================================================
-    while (1) {
+    uint32_t servo_pulse = SERVO_MIN_US;
+    int servo_direction = 1;
 
-        // ── Leer sensor de humedad ───────────────────────────────
-        // Lee el voltaje analógico del sensor y lo convierte a porcentaje
-        adc_oneshot_read(adc_handle, HUM_ADC_CHANNEL, &adc_raw);
+    TickType_t last_lcd_update = 0;
+    TickType_t lcd_update_interval = pdMS_TO_TICKS(200);
 
-        // Fórmula de conversión: interpola linealmente entre ADC_SECO y ADC_MOJADO
-        // Cuando adc_raw = ADC_SECO (1178) → humedad = 0%
-        // Cuando adc_raw = ADC_MOJADO (617) → humedad = 100%
-        humedad = (adc_raw - ADC_SECO) * (100.0f / (ADC_MOJADO - ADC_SECO));
+  while (1) {
+    // ── Leer sensor de humedad ───────────────────────────────
+    adc_oneshot_read(adc_handle, HUM_ADC_CHANNEL, &adc_raw);
 
-        // Limita el valor entre 0% y 100% por si hay lecturas fuera de rango
-        if (humedad < 0)   humedad = 0;
-        if (humedad > 100) humedad = 100;
+    humedad = (adc_raw - ADC_SECO) * (100.0f / (ADC_MOJADO - ADC_SECO));
 
-        // ── Control automático de riego ──────────────────────────
-        // Si la humedad está por debajo del umbral → activa el riego
-        if (humedad < hum_control) {
-            gpio_set_level(RELE_GPIO, RELE_ON);     // Enciende la bomba
-            servo_write_angle(180);                 // Abre la válvula (180°)
-        } else {
-            gpio_set_level(RELE_GPIO, RELE_OFF);    // Apaga la bomba
-            servo_write_angle(0);                   // Cierra la válvula (0°)
-        }
-
-        // ── Mostrar datos en el LCD ──────────────────────────────
-        // Línea 0: muestra la humedad actual y el umbral configurado
-        lcd_set_cursor(0, 0);
-        snprintf(lcd_msg, sizeof(lcd_msg),
-                 "hum: %3.1f%%ctl: %s ", humedad, uart_input);
-        lcd_print(lcd_msg);
-
-        // Espera 500ms antes de la siguiente lectura
-        vTaskDelay(pdMS_TO_TICKS(500));
+    if (humedad < 0) {
+        humedad = 0;
     }
+
+    if (humedad > 100) {
+        humedad = 100;
+    }
+
+    // ── Verificar estado del sensor ──────────────────────────
+    sensor_status_t sensor_status = sensor_check_status(adc_raw);
+
+    int sensor_error_grave = (sensor_status == SENSOR_ERR_ADC_BAJO ||
+                              sensor_status == SENSOR_ERR_ADC_ALTO);
+
+    int riego_activo = 0;
+
+    // ── Control automático de riego ──────────────────────────
+    if (sensor_error_grave) {
+    gpio_set_level(RELE_GPIO, RELE_OFF);
+
+    servo_apagar();
+
+    servo_pulse = SERVO_MIN_US;
+    servo_direction = 1;
+
+    riego_activo = 0;
+
+} else if (humedad < hum_control) {
+    gpio_set_level(RELE_GPIO, RELE_ON);
+
+    riego_activo = 1;
+
+    servo_write_pulse(servo_pulse);
+
+    if (servo_direction == 1) {
+        servo_pulse += SERVO_STEP_US;
+
+        if (servo_pulse >= SERVO_MAX_US) {
+            servo_pulse = SERVO_MAX_US;
+            servo_direction = -1;
+        }
+    } else {
+        servo_pulse -= SERVO_STEP_US;
+
+        if (servo_pulse <= SERVO_MIN_US) {
+            servo_pulse = SERVO_MIN_US;
+            servo_direction = 1;
+        }
+    }
+
+} else {
+    gpio_set_level(RELE_GPIO, RELE_OFF);
+
+    servo_apagar();
+
+    servo_pulse = SERVO_MIN_US;
+    servo_direction = 1;
+
+    riego_activo = 0;
+}
+// Log de cambio de estado de riego
+if (riego_activo != last_riego_activo) {
+    last_riego_activo = riego_activo;
+
+    if (riego_activo) {
+        LOG_INFO("IRR_01", "Riego activado: rele ON y servo en barrido");
+    } else {
+        LOG_INFO("IRR_02", "Riego desactivado: rele OFF y servo apagado");
+    }
+}
+
+    // ── Mostrar datos en el LCD ──────────────────────────────
+    if ((xTaskGetTickCount() - last_lcd_update) >= lcd_update_interval) {
+        last_lcd_update = xTaskGetTickCount();
+
+        lcd_update_status(humedad, hum_control, sensor_status, riego_activo);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(LOOP_DELAY_MS));
+
+
+// Log de cambio de estado del sensor
+if (sensor_status != last_sensor_status_logged) {
+    last_sensor_status_logged = sensor_status;
+
+    if (sensor_status == SENSOR_OK) {
+        LOG_INFO("SENS_00", "Sensor en rango normal");
+    } else if (sensor_status == SENSOR_WARN_FUERA_CALIBRACION) {
+        LOG_WARN("SENS_01", "Sensor fuera del rango de calibracion");
+    } else if (sensor_status == SENSOR_ERR_ADC_BAJO) {
+        LOG_ERROR("SENS_02", "Error: ADC demasiado bajo");
+    } else if (sensor_status == SENSOR_ERR_ADC_ALTO) {
+        LOG_ERROR("SENS_03", "Error: ADC demasiado alto");
+    }
+}
+}
 }
